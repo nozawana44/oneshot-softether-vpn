@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: One shot softether vpn server
+
+Parameters:
+  NameTagPrefix:
+    Type: String
+    Default: oneshot-softether-vpn
+    Description: Prefix of Name tags.
+  VPNServerPassword:
+    Type: String
+    NoEcho: true
+    Description: VPN Server Administrator password.
+  VPNUser:
+    Type: String
+    NoEcho: true
+    Description: User name.
+  VPNUserPassword:
+    Type: String
+    NoEcho: true
+    Description: User password.
+  VPNPSK:
+    Type: String
+    NoEcho: true
+    MaxLength: 9
+    Description: Pre Shared Key.
+  KeyPair:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Amazon EC2 Key Pair
+    
+Mappings:
+  StackConfig:
+    VPC:
+      CIDR: 10.254.254.0/24
+    PublicSubnet:
+      CIDR: 10.254.254.0/26
+    EC2:
+      InstanceType: t2.nano
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [ StackConfig, VPC, CIDR ]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref NameTagPrefix, vpc ] ]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref NameTagPrefix, igw ] ]
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: AttachGateway
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref NameTagPrefix, public-route-table ] ]
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref "AWS::Region"
+      CidrBlock: !FindInMap [ StackConfig, PublicSubnet, CIDR ]
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref NameTagPrefix, public-subnet ] ]
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  EC2SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable ssh access and L2TP over IPsec to the instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 500
+          ToPort: 500
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 4500
+          ToPort: 4500
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref NameTagPrefix, sg ] ]
+  EC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !FindInMap [ StackConfig, EC2, InstanceType ]
+      KeyName: !Ref KeyPair
+      ImageId: !Ref Ubuntu2004Ami
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref EC2SG
+          SubnetId: !Ref PublicSubnet
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euv
+            apt-add-repository -y ppa:paskal-07/softethervpn
+            apt-get update
+            apt-get install -y softether-vpnserver
+            INITFILE=$(mktemp XXXXXX_vpn.init)
+            cat << EOF > ${!INITFILE}
+            ServerPasswordSet ${VPNServerPassword}
+            HubCreate oneshot-vpn /PASSWORD:${VPNServerPassword}
+            Hub oneshot-vpn
+            UserCreate ${VPNUser} /Group:none /REALNAME:user1 /NOTE:none
+            UserPasswordSet ${VPNUser} /PASSWORD:${VPNUserPassword}
+            IPsecEnable /L2TP:yes /L2TPRAW:no /ETHERIP:no /DEFAULTHUB:oneshot-vpn /PSK:${VPNPSK}
+            SecureNatEnable
+            Dhcpset /Start:192.168.30.10 /End:192.168.30.200 /Mask:255.255.255.0 /Expire:7200 /GW:192.168.30.1 /DNS:8.8.8.8 /DNS2:none /Domain:none /Log:yes /PushRoute:"0.0.0.0/0.0.0.0/192.168.30.1"
+            EOF
+            vpncmd /server localhost /in:${!INITFILE}
+            rm ${!INITFILE}
+          - {
+              VPNServerPassword: !Ref VPNServerPassword,
+              VPNUser: !Ref VPNUser,
+              VPNUserPassword: !Ref VPNUserPassword,
+              VPNPSK: !Ref VPNPSK
+            }
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref NameTagPrefix, ec2 ] ]
+  DescribeImagesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DescribeImages
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action: ec2:DescribeImages
+                Effect: Allow
+                Resource: "*"
+  GetLatestAMI:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.6
+      Handler: index.handler
+      Role: !Sub ${DescribeImagesRole.Arn}
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import traceback
+
+          def handler(event, context):
+            try:
+              response = boto3.client('ec2').describe_images(
+                  Owners=[event['ResourceProperties']['Owner']],
+                  Filters=[
+                    {'Name': 'name', 'Values': [event['ResourceProperties']['Name']]},
+                    {'Name': 'architecture', 'Values': [event['ResourceProperties']['Architecture']]},
+                    {'Name': 'root-device-type', 'Values': ['ebs']},
+                  ],
+              )
+
+              amis = sorted(response['Images'],
+                            key=lambda x: x['CreationDate'],
+                            reverse=True)
+              id = amis[0]['ImageId']
+
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, id)
+            except:
+              traceback.print_last()
+              cfnresponse.send(event, context, cfnresponse.FAIL, {}, "ok")
+  Ubuntu2004Ami:
+    Type: Custom::FindAMI
+    Properties:
+      ServiceToken: !Sub ${GetLatestAMI.Arn}
+      Owner: "099720109477"
+      Name: "ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64*"
+      Architecture: "x86_64"
+Outputs:
+  PublicSubnet:
+    Value: !GetAtt [ EC2, PublicIp ]
